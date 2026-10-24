@@ -104,7 +104,7 @@ async function loadSharedData(){
   const {data: remoteTables,error: tablesError}=await sbClient.from('restaurant_tables').select('id,name,active').order('id');
   if(tablesError) throw new Error('Não foi possível carregar mesas: '+tablesError.message);
   tables=(remoteTables||[]).filter(t=>t.active!==false).map(t=>({id:Number(t.id),name:t.name}));
-  const {data: remoteTabs,error: tabsError}=await sbClient.from('tabs').select('id,table_id,waiter_id,status,opened_at,closed_at').order('opened_at',{ascending:false}).limit(300);
+  const {data: remoteTabs,error: tabsError}=await sbClient.from('tabs').select('id,table_id,waiter_id,customer_name,status,opened_at,closed_at').order('opened_at',{ascending:false}).limit(300);
   if(tabsError) throw new Error('Não foi possível carregar comandas: '+tabsError.message);
   const allTabIds=(remoteTabs||[]).map(t=>t.id);
   let remoteTabOrders=[];
