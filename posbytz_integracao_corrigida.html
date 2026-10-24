@@ -91,46 +91,59 @@ async function loadAuthProfile(user){
 }
 
 async function loadSharedData(){
-  // Load products from the shared database so all devices use the same product IDs.
   const {data: remoteProducts,error: productsError}=await sbClient
-    .from('products')
-    .select('id,name,price,cost,stock_quantity,active,category,emoji')
-    .eq('active',true)
-    .order('id');
-  if(productsError) throw new Error('Login funcionou, mas não foi possível carregar produtos do banco: '+productsError.message);
-  products= (remoteProducts||[]).map(p=>({
-    id:p.id, name:p.name, price:Number(p.price||0), cost:Number(p.cost||0),
-    stock:Number(p.stock_quantity||0), active:p.active, category:p.category||'Geral',
-    emoji:p.emoji||'📦'
-  }));
+    .from('products').select('id,name,price,cost,stock_quantity,active,category,emoji').eq('active',true).order('id');
+  if(productsError) throw new Error('Não foi possível carregar produtos: '+productsError.message);
+  products=(remoteProducts||[]).map(p=>({id:p.id,name:p.name,price:Number(p.price||0),cost:Number(p.cost||0),stock:Number(p.stock_quantity||0),active:p.active,category:p.category||'Geral',emoji:p.emoji||'📦'}));
+
   const {data: remoteSales,error: salesError}=await sbClient
-    .from('posbytz_sales')
-    .select('id,user_id,total,profit,payment_method,status,created_at,posbytz_sale_items(id,product_id,product_name,quantity,unit_price,unit_cost)')
-    .order('created_at',{ascending:false})
-    .limit(200);
+    .from('posbytz_sales').select('id,user_id,customer_id,total,profit,payment_method,status,created_at,posbytz_sale_items(id,product_id,product_name,quantity,unit_price,unit_cost)').order('created_at',{ascending:false}).limit(200);
   if(salesError) throw new Error('Não foi possível carregar vendas compartilhadas: '+salesError.message);
-  orders=(remoteSales||[]).map(s=>{
-    const d=new Date(s.created_at);
-    return {
-      id:String(s.id), date:d.toLocaleDateString('en-CA'),
-      time:d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
-      items:(s.posbytz_sale_items||[]).map(i=>({
-        id:i.product_id, name:i.product_name, qty:Number(i.quantity),
-        price:Number(i.unit_price), cost:Number(i.unit_cost||0)
-      })),
-      total:Number(s.total||0), profit:Number(s.profit||0),
-      payment:s.payment_method||'Pix', status:s.status||'Concluído'
-    };
-  });
+  orders=(remoteSales||[]).map(s=>{const d=new Date(s.created_at);return {id:String(s.id),date:d.toLocaleDateString('en-CA'),time:d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),items:(s.posbytz_sale_items||[]).map(i=>({id:i.product_id,name:i.product_name,qty:Number(i.quantity),price:Number(i.unit_price),cost:Number(i.unit_cost||0)})),total:Number(s.total||0),profit:Number(s.profit||0),payment:s.payment_method||'Pix',status:s.status||'Concluído',customerId:s.customer_id||0};});
+
+  const {data: remoteTables,error: tablesError}=await sbClient.from('restaurant_tables').select('id,name,active').order('id');
+  if(tablesError) throw new Error('Não foi possível carregar mesas: '+tablesError.message);
+  tables=(remoteTables||[]).filter(t=>t.active!==false).map(t=>({id:Number(t.id),name:t.name}));
+  const {data: remoteTabs,error: tabsError}=await sbClient.from('tabs').select('id,table_id,waiter_id,status,opened_at,closed_at').order('opened_at',{ascending:false}).limit(300);
+  if(tabsError) throw new Error('Não foi possível carregar comandas: '+tabsError.message);
+  const allTabIds=(remoteTabs||[]).map(t=>t.id);
+  let remoteTabOrders=[];
+  if(allTabIds.length){const {data,error}=await sbClient.from('orders').select('id,tab_id,product_id,quantity,unit_price,status,created_at').in('tab_id',allTabIds);if(error)throw new Error('Não foi possível carregar itens das comandas: '+error.message);remoteTabOrders=data||[];}
+  const {data: profiles}=await sbClient.from('profiles').select('id,full_name,role,active').eq('active',true);
+  const profileNames=new Map((profiles||[]).map(x=>[String(x.id),x.full_name||'Usuário']));
+  const tableNames=new Map(tables.map(t=>[Number(t.id),t.name]));
+  const itemMap=new Map();
+  for(const row of remoteTabOrders){const key=String(row.tab_id);if(!itemMap.has(key))itemMap.set(key,[]);const p=products.find(x=>Number(x.id)===Number(row.product_id));itemMap.get(key).push({id:Number(row.product_id),orderId:Number(row.id),name:p?.name||'Produto removido',price:Number(row.unit_price||0),cost:Number(p?.cost||0),stock:Number(p?.stock||0),qty:Number(row.quantity||0),emoji:p?.emoji||'📦',category:p?.category||'Geral'});}
+  comandas=(remoteTabs||[]).map(t=>({id:String(t.id),tableId:Number(t.table_id),tableName:tableNames.get(Number(t.table_id))||('Mesa '+t.table_id),waiterId:String(t.waiter_id||''),waiterName:profileNames.get(String(t.waiter_id))||(String(t.waiter_id)===String(currentUser?.id)?(currentProfile?.full_name||'Usuário'):'Equipe'),guest:'',items:itemMap.get(String(t.id))||[],status:['open','aberta','aberto'].includes(String(t.status||'').toLowerCase())?'Aberta':'Fechada',openedAt:t.opened_at?new Date(t.opened_at).toLocaleString('pt-BR'):'',closedAt:t.closed_at?new Date(t.closed_at).toLocaleString('pt-BR'):''}));
   save();
 }
-
+let sharedRealtimeChannel=null;
+function startSharedRealtime(){
+  if(sharedRealtimeChannel) sbClient.removeChannel(sharedRealtimeChannel);
+  sharedRealtimeChannel=sbClient.channel('posbytz-shared-live')
+    .on('postgres_changes',{event:'*',schema:'public',table:'products'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'restaurant_tables'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'tabs'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'orders'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'posbytz_sales'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'posbytz_sale_items'},()=>refreshSharedView())
+    .subscribe();
+}
+let refreshInProgress=false, refreshQueued=false;
+async function refreshSharedView(){
+  if(!currentUser)return;
+  if(refreshInProgress){refreshQueued=true;return;}
+  refreshInProgress=true;
+  try{await loadSharedData();render();}catch(err){console.error('Falha ao sincronizar:',err);}
+  finally{refreshInProgress=false;if(refreshQueued){refreshQueued=false;refreshSharedView();}}
+}
 async function enterWithSession(session){
   if(!session?.user){currentUser=null;currentProfile=null;setAppVisible(false);return;}
   currentUser=session.user;
   try{
     await loadAuthProfile(currentUser);
     await loadSharedData();
+    startSharedRealtime();
     applyRoleAccess();
     setAppVisible(true);
     render();
@@ -154,6 +167,7 @@ document.getElementById('authForm').addEventListener('submit',async e=>{
   finally{button.disabled=false;button.textContent='Entrar';}
 });
 document.getElementById('logoutBtn').addEventListener('click',async()=>{
+  if(sharedRealtimeChannel){await sbClient.removeChannel(sharedRealtimeChannel);sharedRealtimeChannel=null;}
   await sbClient.auth.signOut(); currentUser=null;currentProfile=null;setAppVisible(false);authMessage('');
 });
 sbClient.auth.onAuthStateChange((_event,session)=>{ if(session?.user && !currentUser) setTimeout(()=>enterWithSession(session),0); });
@@ -197,7 +211,7 @@ return `${pageHead('Dashboard','Acompanhe as vendas, pedidos, estoque e desempen
 <div class="grid three"><div class="card"><div class="card-title"><h2>Pedidos recentes</h2><button class="secondary" onclick="setPage('orders')">Ver todos</button></div>${orders.slice(0,4).length?orders.slice(0,4).map(o=>`<div class="totalrow"><span>#${o.id} · ${o.items.length} item(ns)</span><strong>${money(o.total)}</strong></div>`).join(''):'<div class="empty">Nenhum pedido ainda.</div>'}</div>
 <div class="card"><div class="card-title"><h2>Alertas de estoque</h2><button class="secondary" onclick="setPage('inventory')">Ver estoque</button></div>${low.length?low.map(p=>`<div class="totalrow"><span>${p.emoji} ${p.name}</span><span class="pill ${p.stock===0?'off':'warn'}">${p.stock} un.</span></div>`).join(''):'<p class="green">✓ Nenhum produto com estoque baixo.</p>'}</div>
 <div class="card"><div class="card-title"><h2>Resumo rápido</h2></div><div class="totalrow"><span>Produtos cadastrados</span><strong>${products.length}</strong></div><div class="totalrow"><span>Clientes cadastrados</span><strong>${customers.length}</strong></div><div class="totalrow"><span>Despesas registradas</span><strong>${money(expenses.reduce((s,e)=>s+e.value,0))}</strong></div></div></div>
-<div class="footer-note">Os números começam a refletir seus dados depois que você registra vendas. Esta demonstração salva informações neste navegador/dispositivo.</div>`}
+<div class="footer-note">Produtos, estoque, vendas e comandas são compartilhados pelo Supabase. Clientes e despesas ainda são locais neste navegador.</div>`}
 function topProducts(){let m={};orders.forEach(o=>o.items.forEach(i=>{m[i.id]??={name:i.name,emoji:i.emoji,qty:0,total:0};m[i.id].qty+=i.qty;m[i.id].total+=i.price*i.qty}));return Object.values(m).sort((a,b)=>b.qty-a.qty).slice(0,5)}
 function pos(){return `${pageHead('Frente de caixa','Selecione os produtos, monte o pedido e finalize a venda.')}
 <div class="pos-layout"><div><div class="toolbar"><input id="productSearch" placeholder="Buscar produto..." oninput="renderProductGrid(this.value)"><select id="catFilter" onchange="renderProductGrid(el('productSearch').value)"><option value="">Todas as categorias</option>${[...new Set(products.map(p=>p.category))].map(c=>`<option>${c}</option>`).join('')}</select></div><div class="grid products" id="productGrid">${productCards(products)}</div></div>
@@ -308,24 +322,27 @@ function openCustomerModal(){openModal('Novo cliente',`<div class="formgrid"><di
 function saveCustomer(){let name=el('cName').value.trim();if(!name)return toast('Informe o nome do cliente.');customers.push({id:Date.now(),name,phone:el('cPhone').value.trim(),email:el('cEmail').value.trim()});save();el('modal').classList.remove('show');render();toast('Cliente cadastrado.')}
 function deleteCustomer(id){if(!confirm('Excluir cliente?'))return;customers=customers.filter(c=>c.id!==id);save();render()}
 function reports(){let rev=orders.reduce((s,o)=>s+o.total,0),cost=orders.reduce((s,o)=>s+o.total-o.profit,0);return `${pageHead('Relatórios','Indicadores baseados nos pedidos e produtos registrados.')}<div class="grid stats">${stat('Vendas acumuladas',money(rev),'↗')}${stat('Custo dos itens vendidos',money(cost),'▤')}${stat('Lucro bruto',money(rev-cost),'R$')}${stat('Número de pedidos',orders.length,'▱')}</div><div class="grid two"><div class="card"><div class="card-title"><h2>Produtos mais vendidos</h2><button class="secondary" onclick="exportCSV('top')">Exportar CSV</button></div><div class="tablewrap"><table><thead><tr><th>Produto</th><th>Unidades</th><th>Faturamento</th></tr></thead><tbody>${topProducts().map(p=>`<tr><td>${p.emoji} ${p.name}</td><td>${p.qty}</td><td>${money(p.total)}</td></tr>`).join('')||'<tr><td colspan="3" class="empty">Sem dados ainda.</td></tr>'}</tbody></table></div></div><div class="card"><h2 style="margin-bottom:16px">Por forma de pagamento</h2>${[...new Set(orders.map(o=>o.payment))].map(pay=>`<div class="totalrow"><span>${pay}</span><strong>${money(orders.filter(o=>o.payment===pay).reduce((s,o)=>s+o.total,0))}</strong></div>`).join('')||'<div class="empty">Sem vendas registradas.</div>'}</div></div><div class="card" style="margin-top:16px"><div class="card-title"><h2>Exportar dados</h2></div><p class="muted" style="margin-bottom:14px">Baixe os dados para abrir em planilha.</p><div class="toolbar"><button onclick="exportCSV('orders')">Pedidos CSV</button><button onclick="exportCSV('products')">Produtos CSV</button><button onclick="exportCSV('expenses')">Despesas CSV</button><button onclick="exportCSV('customers')">Clientes CSV</button></div></div>`}
-function settings(){return `${pageHead('Configurações','Preferências básicas e cópia de segurança local.')}<div class="grid two"><div class="card"><h2 style="margin-bottom:14px">Dados da empresa</h2><div class="field"><label>Nome do estabelecimento</label><input id="bizName" value="${localStorage.getItem('pb_bizName')||'Meu Restaurante'}"></div><div class="field" style="margin-top:12px"><label>Moeda</label><select disabled><option>Real brasileiro (BRL)</option></select></div><button style="margin-top:16px" onclick="localStorage.setItem('pb_bizName',el('bizName').value);toast('Nome salvo localmente.')">Salvar configurações</button></div><div class="card"><h2 style="margin-bottom:14px">Backup e dados</h2><p class="muted" style="line-height:1.6;margin-bottom:14px">Exporte uma cópia dos produtos, pedidos, clientes e despesas para guardar seus dados.</p><button onclick="backup()">Baixar backup JSON</button> <button class="secondary" onclick="el('restoreFile').click()">Restaurar backup</button><input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreBackup(event)"><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><button class="danger" onclick="resetDemo()">Restaurar dados de exemplo</button></div></div><div class="notice" style="margin-top:16px">Importante: esta versão guarda os dados no navegador deste dispositivo. Ela ainda não tem servidor, sincronização entre dispositivos, login seguro, emissão fiscal ou integração real com maquininha/WhatsApp.</div>`}
+function settings(){return `${pageHead('Configurações','Preferências básicas e cópia de segurança local.')}<div class="grid two"><div class="card"><h2 style="margin-bottom:14px">Dados da empresa</h2><div class="field"><label>Nome do estabelecimento</label><input id="bizName" value="${localStorage.getItem('pb_bizName')||'Meu Restaurante'}"></div><div class="field" style="margin-top:12px"><label>Moeda</label><select disabled><option>Real brasileiro (BRL)</option></select></div><button style="margin-top:16px" onclick="localStorage.setItem('pb_bizName',el('bizName').value);toast('Nome salvo localmente.')">Salvar configurações</button></div><div class="card"><h2 style="margin-bottom:14px">Backup e dados</h2><p class="muted" style="line-height:1.6;margin-bottom:14px">Exporte uma cópia dos produtos, pedidos, clientes e despesas para guardar seus dados.</p><button onclick="backup()">Baixar backup JSON</button> <button class="secondary" onclick="el('restoreFile').click()">Restaurar backup</button><input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreBackup(event)"><hr style="border:0;border-top:1px solid var(--line);margin:18px 0"><button class="danger" onclick="resetDemo()">Restaurar dados de exemplo</button></div></div><div class="notice" style="margin-top:16px">Produtos, estoque, vendas e comandas são carregados do Supabase. A sincronização em tempo real depende de executar a instalação SQL fornecida e habilitar as tabelas na publicação Realtime. Clientes, despesas e algumas preferências ainda ficam neste navegador.</div>`}
 function exportCSV(type){let rows=[],name=type;const q=v=>'"'+String(v??'').replaceAll('"','""')+'"';if(type==='orders'){rows=[['Pedido','Data','Hora','Pagamento','Total','Lucro bruto','Itens'],...orders.map(o=>[o.id,o.date,o.time,o.payment,o.total,o.profit,o.items.map(i=>i.qty+'x '+i.name).join('; ')])]}else if(type==='products'){rows=[['ID','Produto','Categoria','Preço','Custo','Estoque'],...products.map(p=>[p.id,p.name,p.category,p.price,p.cost,p.stock])]}else if(type==='expenses'){rows=[['Data','Descrição','Categoria','Valor'],...expenses.map(e=>[e.date,e.description,e.category,e.value])]}else if(type==='customers'){rows=[['Nome','Telefone','Email'],...customers.map(c=>[c.name,c.phone,c.email])]}else if(type==='top'){rows=[['Produto','Unidades','Faturamento'],...topProducts().map(p=>[p.name,p.qty,p.total])]}let csv='\ufeff'+rows.map(r=>r.map(q).join(';')).join('\r\n');let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8;'}));a.download='posbytz_'+name+'.csv';a.click();URL.revokeObjectURL(a.href)}
 function backup(){let data={products,orders,customers,expenses,waiters,tables,comandas,bizName:localStorage.getItem('pb_bizName')||'Meu Restaurante'};let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));a.download='posbytz_backup.json';a.click();URL.revokeObjectURL(a.href)}
 function restoreBackup(ev){let f=ev.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{let d=JSON.parse(r.result);if(!Array.isArray(d.products)||!Array.isArray(d.orders))throw Error();products=d.products;orders=d.orders;customers=d.customers||[];expenses=d.expenses||[];waiters=d.waiters||waiters;tables=d.tables||tables;comandas=d.comandas||[];localStorage.setItem('pb_bizName',d.bizName||'Meu Restaurante');save();render();toast('Backup restaurado.')}catch(e){toast('Arquivo de backup inválido.')}};r.readAsText(f);ev.target.value=''}
 function resetDemo(){if(!confirm('Isso substituirá os dados atuais pelos dados iniciais e apagará vendas/clientes/despesas deste navegador. Continuar?'))return;products=starterProducts.map(p=>({...p}));orders=[];customers=[];expenses=[];cart=[];save();render();toast('Dados de exemplo restaurados.')}
 
-function waiterOptions(selected=''){return waiters.filter(w=>w.active).map(w=>`<option value="${w.id}" ${String(w.id)===String(selected)?'selected':''}>${w.name}</option>`).join('')}
+function waiterOptions(selected=''){const id=String(currentUser?.id||'');const name=currentProfile?.full_name||currentUser?.email||'Usuário logado';return `<option value="${id}" selected>${name} (usuário logado)</option>`}
 function openComandaModal(tableId=null){
  const freeTables=tables.filter(t=>!comandas.some(c=>c.tableId===t.id&&c.status==='Aberta'));
  openModal('Abrir comanda',`<div class="formgrid"><div class="field"><label>Mesa</label><select id="comTable">${(tableId?tables.filter(t=>t.id===tableId):freeTables).map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div><div class="field"><label>Garçom responsável</label><select id="comWaiter">${waiterOptions()}</select></div><div class="field"><label>Cliente (opcional)</label><input id="comGuest" placeholder="Ex.: Família da janela"></div></div><button style="width:100%;margin-top:16px" onclick="createComanda()">Abrir comanda</button>`)
 }
-function createComanda(){
- let tableId=Number(el('comTable')?.value), waiterId=Number(el('comWaiter')?.value);
+async function createComanda(){
+ const tableId=Number(el('comTable')?.value);
  if(!tableId)return toast('Não há mesa livre disponível.');
+ if(!currentUser)return toast('Faça login novamente para abrir uma comanda.');
  if(comandas.some(c=>c.tableId===tableId&&c.status==='Aberta'))return toast('Essa mesa já possui comanda aberta.');
- let w=waiters.find(w=>w.id===waiterId);
- comandas.unshift({id:Date.now().toString().slice(-7),tableId,tableName:tables.find(t=>t.id===tableId)?.name||'Mesa',waiterId,waiterName:w?.name||'Não atribuído',guest:el('comGuest').value.trim(),items:[],status:'Aberta',openedAt:new Date().toLocaleString('pt-BR'),createdDate:new Date().toLocaleDateString('en-CA')});
- save();el('modal').classList.remove('show');setPage('comandas');toast('Comanda aberta.')
+ try{
+  const {data,error}=await sbClient.from('tabs').insert({table_id:tableId,waiter_id:currentUser.id,status:'open'}).select('id').single();
+  if(error)throw error;
+  el('modal').classList.remove('show');await loadSharedData();setPage('comandas');toast('Comanda aberta e compartilhada entre os dispositivos.');
+ }catch(err){toast('Não foi possível abrir a comanda: '+err.message);}
 }
 function comandasPage(){
  let open=comandas.filter(c=>c.status==='Aberta');
@@ -343,14 +360,40 @@ function manageComanda(id){
  <div style="margin-top:18px"><h3>Consumo da mesa</h3>${c.items.length?c.items.map((i,idx)=>`<div class="cart-line"><div><strong>${i.name}</strong><div class="muted">${money(i.price)} cada</div></div><div class="qty"><button onclick="changeComandaQty('${c.id}',${idx},-1)">−</button><strong>${i.qty}</strong><button onclick="changeComandaQty('${c.id}',${idx},1)">+</button></div><strong>${money(i.price*i.qty)}</strong></div>`).join(''):'<div class="empty">Nenhum item lançado ainda.</div>'}</div>
  <div class="totalrow" style="font-size:20px;margin-top:18px"><strong>Total parcial</strong><strong>${money(total)}</strong></div><div class="field"><label>Forma de pagamento ao fechar</label><select id="comPayment"><option>Pix</option><option>Dinheiro</option><option>Cartão de débito</option><option>Cartão de crédito</option></select></div><button style="width:100%;margin-top:12px" onclick="closeComanda('${c.id}')">Fechar comanda e registrar venda</button>`)
 }
-function updateComandaWaiter(id, waiterId){let c=comandas.find(c=>String(c.id)===String(id)),w=waiters.find(w=>w.id===Number(waiterId));if(c&&w){c.waiterId=w.id;c.waiterName=w.name;save();}}
-function addToComanda(id){let c=comandas.find(c=>String(c.id)===String(id)),p=products.find(p=>p.id===Number(el('comProduct')?.value)),qty=Math.floor(Number(el('comQty')?.value||1));if(!c||!p||qty<1)return toast('Confira o produto e a quantidade.');let current=c.items.find(i=>i.id===p.id)?.qty||0;if(current+qty>p.stock)return toast('Quantidade maior que o estoque disponível.');let item=c.items.find(i=>i.id===p.id);if(item)item.qty+=qty;else c.items.push({...p,qty});save();manageComanda(id);toast('Item lançado na comanda.')}
-function changeComandaQty(id,idx,d){let c=comandas.find(c=>String(c.id)===String(id));if(!c)return;let i=c.items[idx],p=products.find(p=>p.id===i.id);if(d>0&&i.qty+1>(p?.stock||0))return toast('Estoque insuficiente.');i.qty+=d;if(i.qty<=0)c.items.splice(idx,1);save();manageComanda(id)}
-function closeComanda(id){let c=comandas.find(c=>String(c.id)===String(id));if(!c||!c.items.length)return toast('Lance pelo menos um item antes de fechar.');for(let i of c.items){let p=products.find(p=>p.id===i.id);if(!p||p.stock<i.qty)return toast('Estoque insuficiente para '+i.name)}
- let total=c.items.reduce((s,i)=>s+i.price*i.qty,0),cost=c.items.reduce((s,i)=>s+i.cost*i.qty,0);
- c.items.forEach(i=>products.find(p=>p.id===i.id).stock-=i.qty);
- orders.unshift({id:Date.now().toString().slice(-7),date:new Date().toLocaleDateString('en-CA'),time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),items:c.items.map(i=>({...i})),total,profit:total-cost,payment:el('comPayment')?.value||'Pix',customerId:0,status:'Concluído',tableName:c.tableName,waiterName:c.waiterName,comandaId:c.id});
- c.status='Fechada';c.closedAt=new Date().toLocaleString('pt-BR');save();el('modal').classList.remove('show');setPage('comandas');toast('Comanda fechada e venda registrada.')}
+async function updateComandaWaiter(id, waiterId){
+ // O vínculo da comanda usa o perfil autenticado (UUID), não o cadastro local de garçons.
+ const c=comandas.find(c=>String(c.id)===String(id));if(!c)return;
+ if(String(waiterId)!==String(currentUser?.id))return toast('A comanda fica vinculada ao usuário autenticado.');
+ const {error}=await sbClient.from('tabs').update({waiter_id:currentUser.id}).eq('id',Number(id));
+ if(error)toast('Não foi possível atualizar o responsável: '+error.message);else await loadSharedData();
+}
+async function addToComanda(id){
+ const c=comandas.find(c=>String(c.id)===String(id)),p=products.find(p=>p.id===Number(el('comProduct')?.value)),qty=Math.floor(Number(el('comQty')?.value||1));
+ if(!c||c.status!=='Aberta'||!p||qty<1)return toast('Confira a comanda, o produto e a quantidade.');
+ const current=c.items.find(i=>i.id===p.id)?.qty||0;
+ if(current+qty>p.stock)return toast('Quantidade maior que o estoque disponível.');
+ try{const {error}=await sbClient.from('orders').insert({tab_id:Number(id),product_id:p.id,quantity:qty,unit_price:p.price,status:'open'});if(error)throw error;await loadSharedData();manageComanda(id);toast('Item lançado e sincronizado.');}
+ catch(err){toast('Não foi possível lançar o item: '+err.message);}
+}
+async function changeComandaQty(id,idx,d){
+ const c=comandas.find(c=>String(c.id)===String(id));if(!c||c.status!=='Aberta')return;
+ const i=c.items[idx],p=products.find(p=>p.id===i?.id);if(!i)return;
+ if(d>0&&(i.qty+1)>(p?.stock||0))return toast('Estoque insuficiente.');
+ try{
+  if(i.qty+d<=0){const {error}=await sbClient.from('orders').delete().eq('id',i.orderId);if(error)throw error;}
+  else {const {error}=await sbClient.from('orders').update({quantity:i.qty+d}).eq('id',i.orderId);if(error)throw error;}
+  await loadSharedData();manageComanda(id);
+ }catch(err){toast('Não foi possível alterar a quantidade: '+err.message);}
+}
+async function closeComanda(id){
+ const c=comandas.find(c=>String(c.id)===String(id));if(!c||!c.items.length)return toast('Lance pelo menos um item antes de fechar.');
+ const payment=el('comPayment')?.value||'Pix';
+ try{
+  const {data,error}=await sbClient.rpc('close_pos_tab',{p_tab_id:Number(id),p_payment_method:payment});
+  if(error)throw error;
+  el('modal').classList.remove('show');await loadSharedData();setPage('comandas');toast('Comanda fechada, estoque atualizado e venda registrada.');
+ }catch(err){toast('Não foi possível fechar a comanda: '+err.message+'. Confira se executou o arquivo SQL de instalação.');}
+}
 function waitersPage(){return `${pageHead('Garçons','Cadastre a equipe e veja quem está responsável por cada comanda.',`<button onclick="openWaiterModal()">＋ Cadastrar garçom</button>`)}<div class="card"><div class="tablewrap"><table><thead><tr><th>Garçom</th><th>Status</th><th>Comandas abertas</th><th>Consumo em atendimento</th><th>Ações</th></tr></thead><tbody>${waiters.map(w=>{let cs=comandas.filter(c=>c.status==='Aberta'&&c.waiterId===w.id);return `<tr><td><strong>♙ ${w.name}</strong></td><td><span class="pill ${w.active?'':'off'}">${w.active?'Ativo':'Inativo'}</span></td><td>${cs.length}</td><td>${money(cs.reduce((s,c)=>s+c.items.reduce((a,i)=>a+i.price*i.qty,0),0))}</td><td><div class="row-actions"><button class="secondary" onclick="toggleWaiter(${w.id})">${w.active?'Desativar':'Ativar'}</button><button class="secondary" onclick="renameWaiter(${w.id})">Renomear</button></div></td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Cadastre o primeiro garçom.</td></tr>'}</tbody></table></div></div><p class="footer-note">Garçons desativados deixam de aparecer em novas comandas. Comandas já abertas preservam o responsável.</p>`}
 function openWaiterModal(){openModal('Cadastrar garçom',`<div class="field"><label>Nome do garçom</label><input id="waiterName" placeholder="Ex.: João"></div><button style="width:100%;margin-top:16px" onclick="saveWaiter()">Cadastrar</button>`)}
 function saveWaiter(){let name=el('waiterName').value.trim();if(!name)return toast('Informe o nome.');waiters.push({id:Math.max(0,...waiters.map(w=>w.id))+1,name,active:true});save();el('modal').classList.remove('show');render();toast('Garçom cadastrado.')}
