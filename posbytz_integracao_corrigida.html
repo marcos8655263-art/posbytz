@@ -372,7 +372,7 @@ async function addToComanda(id){
  if(!c||c.status!=='Aberta'||!p||qty<1)return toast('Confira a comanda, o produto e a quantidade.');
  const current=c.items.find(i=>i.id===p.id)?.qty||0;
  if(current+qty>p.stock)return toast('Quantidade maior que o estoque disponível.');
- try{const {error}=await sbClient.from('orders').insert({tab_id:Number(id),product_id:p.id,quantity:qty,unit_price:p.price,status:'open'});if(error)throw error;await loadSharedData();manageComanda(id);toast('Item lançado e sincronizado.');}
+ try{const {error}=await sbClient.from('orders').insert({tab_id:Number(id),product_id:p.id,quantity:qty,unit_price:p.price,status:'pending'});if(error)throw error;await loadSharedData();manageComanda(id);toast('Item lançado e sincronizado.');}
  catch(err){toast('Não foi possível lançar o item: '+err.message);}
 }
 async function changeComandaQty(id,idx,d){
