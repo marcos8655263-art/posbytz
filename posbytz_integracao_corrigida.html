@@ -335,11 +335,12 @@ function openComandaModal(tableId=null){
 }
 async function createComanda(){
  const tableId=Number(el('comTable')?.value);
+  const customerName=el('comGuest')?.value?.trim()||null;
  if(!tableId)return toast('Não há mesa livre disponível.');
  if(!currentUser)return toast('Faça login novamente para abrir uma comanda.');
  if(comandas.some(c=>c.tableId===tableId&&c.status==='Aberta'))return toast('Essa mesa já possui comanda aberta.');
  try{
-  const {data,error}=await sbClient.from('tabs').insert({table_id:tableId,waiter_id:currentUser.id,status:'open'}).select('id').single();
+  const {data,error}=await sbClient.from('tabs').insert({table_id:tableId,waiter_id:currentUser.id,customer_name:customerName,status:'open'}).select('id').single();
   if(error)throw error;
   el('modal').classList.remove('show');await loadSharedData();setPage('comandas');toast('Comanda aberta e compartilhada entre os dispositivos.');
  }catch(err){toast('Não foi possível abrir a comanda: '+err.message);}
