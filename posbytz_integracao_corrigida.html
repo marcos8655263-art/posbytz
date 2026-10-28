@@ -140,16 +140,19 @@ async function refreshSharedView(){
 async function enterWithSession(session){
   if(!session?.user){currentUser=null;currentProfile=null;setAppVisible(false);return;}
   currentUser=session.user;
-  try{
-    await loadAuthProfile(currentUser);
-    await loadSharedData();
-    startSharedRealtime();
-    applyRoleAccess();
-    setAppVisible(true);
-    render();
-    }catch(err){
-  console.error('Erro ao carregar o sistema:',err);
-  authMessage('Erro ao entrar: '+(err.message || String(err)));
+  try {
+  authMessage('Login aceito. Carregando perfil...');
+  await loadAuthProfile(currentUser);
+  authMessage('Perfil carregado. Carregando dados...');
+  await loadSharedData();
+  authMessage('Dados carregados. Iniciando sincronização...');
+  startSharedRealtime();
+  applyRoleAccess();
+  setAppVisible(true);
+  render();
+} catch(err) {
+  console.error('Erro ao carregar o sistema:', err);
+  authMessage('Erro ao entrar: ' + (err.message || String(err)));
 }
 }
 document.getElementById('authForm').addEventListener('submit',async e=>{
