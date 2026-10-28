@@ -147,11 +147,10 @@ async function enterWithSession(session){
     applyRoleAccess();
     setAppVisible(true);
     render();
-  }catch(err){
-    await sbClient.auth.signOut();
-    currentUser=null;currentProfile=null;setAppVisible(false);
-    authMessage(err.message || 'Não foi possível validar seu perfil.');
-  }
+    }catch(err){
+  console.error('Erro ao carregar o sistema:',err);
+  authMessage('Erro ao entrar: '+(err.message || String(err)));
+}
 }
 document.getElementById('authForm').addEventListener('submit',async e=>{
   e.preventDefault(); authMessage('');
