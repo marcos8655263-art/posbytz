@@ -168,7 +168,7 @@ authMessage('Verificando login...');
 });
     if(error) throw error;
     await enterWithSession(data.session);
-  }catch(err){authMessage(err.message || 'Falha no login. Confira e-mail e senha.');}
+  }catch(err){console.error('ERRO LOGIN:',err);authMessage('Erro: '+(err.message||String(err)));}
   finally{button.disabled=false;button.textContent='Entrar';}
 });
 document.getElementById('logoutBtn').addEventListener('click',async()=>{
