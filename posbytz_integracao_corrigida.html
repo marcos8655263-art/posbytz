@@ -162,7 +162,6 @@ const senhaDigitada = document.getElementById('authPassword').value;
 authMessage('Verificando login...');
   const button=document.getElementById('authSubmit'); button.disabled=true; button.textContent='Entrando…';
   try{
-    const {data,error}=await sbClient.auth.signInWithPassword({
       const {data,error}=await sbClient.auth.signInWithPassword({
   email: emailDigitado.trim(),
   password: senhaDigitada
