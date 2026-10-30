@@ -285,7 +285,7 @@ async function finishSale(){
       saleId=null;
       throw new Error('Falha ao salvar itens (produto ID '+rows.map(r=>r.product_id).join(', ')+'): '+itemsError.message);
     }
-    const order={id:String(sale.id),date:new Date().getFullYear()+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0')
+    const order={id:String(sale.id),date:new Date().getFullYear()+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0'),
       time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
       items:verified.map(item=>({...item})),total,profit:total-cost,payment,status:'Concluído'};
     orders.unshift(order);
