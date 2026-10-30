@@ -208,13 +208,13 @@ function openModal(title,html,after){el('modalTitle').textContent=title;el('moda
 function stat(title,value,icon,sub=''){return `<div class="card stat"><div class="stat-icon">${icon}</div><div><label>${title}</label><div class="value">${value}</div><small>${sub}</small></div></div>`}
 function pageHead(title,sub,button=''){return `<div class="pagehead"><div><h1>${title}</h1><p>${sub}</p></div>${button}</div>`}
 function todayOrders(){return orders.filter(o=>o.date===new Date().toLocaleDateString('en-CA'))}
-function dashboard(){let os=todayOrders(),sales=os.reduce((s,o)=>s+o.total,0),profit=os.reduce((s,o)=>s+o.profit,0),low=products.filter(p=>p.stock<=10);let days=['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'];
-let chart=days.map((d,i)=>{
+function dashboard(){let os=todayOrders(),sales=os.reduce((s,o)=>s+o.total,0),profit=os.reduce((s,o)=>s+o.profit,0),low=products.filter(p=>p.stock<=10);const days=['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+let chart=Array.from({length:7},(_,i)=>{
   let dt=new Date();
   dt.setHours(12,0,0,0);
   dt.setDate(dt.getDate()-(6-i));
   let key=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
-  return {d,v:orders.filter(o=>o.date===key).reduce((s,o)=>s+o.total,0)};
+  return {d:days[dt.getDay()],v:orders.filter(o=>o.date===key).reduce((s,o)=>s+o.total,0)};
 });
 let max=Math.max(1,...chart.map(x=>x.v));
 return `${pageHead('Dashboard','Acompanhe as vendas, pedidos, estoque e desempenho do seu negócio.',`<button onclick="setPage('pos')">＋ Nova venda</button>`)}
