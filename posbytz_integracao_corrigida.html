@@ -210,11 +210,12 @@ function pageHead(title,sub,button=''){return `<div class="pagehead"><div><h1>${
 function todayOrders(){return orders.filter(o=>o.date===new Date().toLocaleDateString('en-CA'))}
 function dashboard(){let os=todayOrders(),sales=os.reduce((s,o)=>s+o.total,0),profit=os.reduce((s,o)=>s+o.profit,0),low=products.filter(p=>p.stock<=10);const days=['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
 let chart=Array.from({length:7},(_,i)=>{
-  let dt=new Date();
+  const dt=new Date();
   dt.setHours(12,0,0,0);
   dt.setDate(dt.getDate()-(6-i));
-  let key=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
-  return {d:days[dt.getDay()],v:orders.filter(o=>o.date===key).reduce((s,o)=>s+o.total,0)};
+  const key=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
+  const value=orders.reduce((sum,o)=>sum+(String(o.date||'').slice(0,10)===key?Number(o.total)||0:0),0);
+  return {d:days[dt.getDay()]+' '+String(dt.getDate()).padStart(2,'0'),v:value};
 });
 let max=Math.max(1,...chart.map(x=>x.v));
 return `${pageHead('Dashboard','Acompanhe as vendas, pedidos, estoque e desempenho do seu negócio.',`<button onclick="setPage('pos')">＋ Nova venda</button>`)}
