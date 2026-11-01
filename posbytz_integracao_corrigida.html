@@ -305,13 +305,24 @@ async function finishSale(){
       saleId=null;
       throw new Error('Falha ao salvar itens (produto ID '+rows.map(r=>r.product_id).join(', ')+'): '+itemsError.message);
     }
+    // Decrease stock atomically in the database after the sale and its items are saved.
+    // The SQL RPC locks/updates stock in one transaction and rejects insufficient stock.
+    const {error:stockError}=await sbClient.rpc('decrement_stock_for_sale',{
+      p_items:verified.map(item=>({product_id:item.id,quantity:item.qty}))
+    });
+    if(stockError){
+      await sbClient.from('posbytz_sales').delete().eq('id',sale.id);
+      saleId=null;
+      throw new Error('A venda não foi concluída porque não foi possível baixar o estoque: '+stockError.message);
+    }
     const order={id:String(sale.id),date:new Date().getFullYear()+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+String(new Date().getDate()).padStart(2,'0'),
       time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
       items:verified.map(item=>({...item})),total,profit:total-cost,payment,status:'Concluído'};
     orders.unshift(order);
     cart=[];
-    await loadSharedData();
-    setPage('orders');toast('Venda salva no banco compartilhado!');
+    setPage('orders');
+    toast('Venda salva e estoque atualizado!');
+    try{await loadSharedData();render()}catch(syncError){console.warn('Venda salva; atualização da tela será repetida ao recarregar.',syncError)}
   }catch(err){
     toast('Não foi possível salvar no banco: '+(err.message||'erro desconhecido'));
   }finally{if(button){button.disabled=false;button.textContent='Finalizar venda'}}
