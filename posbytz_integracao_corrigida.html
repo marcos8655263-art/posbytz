@@ -101,6 +101,24 @@ async function loadSharedData(){
   if(salesError) throw new Error('Não foi possível carregar vendas compartilhadas: '+salesError.message);
   orders=(remoteSales||[]).map(s=>{const d=new Date(s.created_at);return {id:String(s.id),date:d.toLocaleDateString('en-CA'),time:d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),items:(s.posbytz_sale_items||[]).map(i=>({id:i.product_id,name:i.product_name,qty:Number(i.quantity),price:Number(i.unit_price),cost:Number(i.unit_cost||0),emoji:products.find(p=>String(p.id)===String(i.product_id))?.emoji||'📦'})),total:Number(s.total||0),profit:Number(s.profit||0),payment:s.payment_method||'Pix',status:s.status||'Concluído',customerId:s.customer_id||0};});
 
+  // Despesas são restritas ao administrador pela política RLS da tabela expenses.
+  if(currentProfile?.role==='admin') {
+    const {data: remoteExpenses,error: expensesError}=await sbClient.from('expenses').select('id,description,category,value,date,created_at').order('date',{ascending:false}).order('id',{ascending:false});
+    if(expensesError) throw new Error('Não foi possível carregar despesas compartilhadas: '+expensesError.message);
+    // Se houver despesas antigas somente neste navegador e a tabela ainda estiver vazia, migra uma única vez.
+    const legacyExpenses=JSON.parse(localStorage.getItem('pb_expenses')||'[]');
+    if((remoteExpenses||[]).length===0 && Array.isArray(legacyExpenses) && legacyExpenses.length>0 && localStorage.getItem('pb_expenses_migrated_to_supabase')!=='yes'){
+      const legacyPayload=legacyExpenses.map(e=>({description:String(e.description||'Despesa antiga'),category:String(e.category||'Outros'),value:Number(e.value||0),date:e.date||today()})).filter(e=>e.value>0);
+      if(legacyPayload.length){const {error:migrationError}=await sbClient.from('expenses').insert(legacyPayload);if(migrationError)throw new Error('Não foi possível migrar despesas antigas: '+migrationError.message);}
+      localStorage.setItem('pb_expenses_migrated_to_supabase','yes');
+      const {data: migratedExpenses,error: reloadExpensesError}=await sbClient.from('expenses').select('id,description,category,value,date,created_at').order('date',{ascending:false}).order('id',{ascending:false});
+      if(reloadExpensesError)throw new Error('Não foi possível confirmar despesas migradas: '+reloadExpensesError.message);
+      expenses=(migratedExpenses||[]).map(e=>({id:e.id,description:e.description||'',category:e.category||'Outros',value:Number(e.value||0),date:e.date||(e.created_at?String(e.created_at).slice(0,10):'')}));
+    } else {
+      expenses=(remoteExpenses||[]).map(e=>({id:e.id,description:e.description||'',category:e.category||'Outros',value:Number(e.value||0),date:e.date|| (e.created_at?String(e.created_at).slice(0,10):'')}));
+    }
+  } else { expenses=[]; }
+
   const {data: remoteTables,error: tablesError}=await sbClient.from('restaurant_tables').select('id,name,active').order('id');
   if(tablesError) throw new Error('Não foi possível carregar mesas: '+tablesError.message);
   tables=(remoteTables||[]).filter(t=>t.active!==false).map(t=>({id:Number(t.id),name:t.name}));
@@ -127,6 +145,7 @@ function startSharedRealtime(){
     .on('postgres_changes',{event:'*',schema:'public',table:'orders'},()=>refreshSharedView())
     .on('postgres_changes',{event:'*',schema:'public',table:'posbytz_sales'},()=>refreshSharedView())
     .on('postgres_changes',{event:'*',schema:'public',table:'posbytz_sale_items'},()=>refreshSharedView())
+    .on('postgres_changes',{event:'*',schema:'public',table:'expenses'},()=>refreshSharedView())
     .subscribe();
 }
 let refreshInProgress=false, refreshQueued=false;
@@ -327,8 +346,23 @@ function editProduct(id){openProductModal(products.find(p=>p.id===id))}
 async function deleteProduct(id){if(!confirm('Desativar este produto no sistema?'))return;try{const {error}=await sbClient.from('products').update({active:false}).eq('id',Number(id));if(error)throw error;await loadSharedData();render();toast('Produto desativado no banco.')}catch(err){toast('Não foi possível desativar o produto: '+err.message)}}
 function accounting(){let rev=orders.reduce((s,o)=>s+o.total,0),profit=orders.reduce((s,o)=>s+o.profit,0),exp=expenses.reduce((s,e)=>s+e.value,0);return `${pageHead('Financeiro','Visão simplificada de vendas, custos e despesas.',`<button onclick="openExpenseModal()">＋ Registrar despesa</button>`)}<div class="grid stats">${stat('Faturamento total',money(rev),'↗','Todas as vendas registradas')}${stat('Lucro bruto estimado',money(profit),'▣','Antes das despesas fixas')}${stat('Despesas lançadas',money(exp),'↘',expenses.length+' lançamento(s)')}${stat('Resultado estimado',money(profit-exp),'R$','Lucro bruto menos despesas')}</div><div class="card"><div class="card-title"><h2>Despesas</h2><button class="secondary" onclick="exportCSV('expenses')">Exportar CSV</button></div><div class="tablewrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th><th>Ação</th></tr></thead><tbody>${expenses.map(e=>`<tr><td>${e.date}</td><td><strong>${e.description}</strong></td><td>${e.category}</td><td>${money(e.value)}</td><td><button class="danger" onclick="deleteExpense(${e.id})">Excluir</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Nenhuma despesa registrada.</td></tr>'}</tbody></table></div></div><p class="footer-note">A estimativa não substitui contabilidade fiscal. Impostos, taxas de cartão, perdas e outros custos não cadastrados não estão incluídos.</p>`}
 function openExpenseModal(){openModal('Registrar despesa',`<div class="formgrid"><div class="field"><label>Descrição</label><input id="eDesc" placeholder="Ex.: Compra de bebidas"></div><div class="field"><label>Categoria</label><select id="eCat"><option>Mercadorias</option><option>Aluguel</option><option>Energia</option><option>Água</option><option>Internet</option><option>Salários</option><option>Manutenção</option><option>Outros</option></select></div><div class="field"><label>Valor (R$)</label><input id="eValue" type="number" min="0" step=".01"></div><div class="field"><label>Data</label><input id="eDate" type="date" value="${new Date().toLocaleDateString('en-CA')}"></div></div><button style="width:100%;margin-top:16px" onclick="saveExpense()">Salvar despesa</button>`)}
-function saveExpense(){let description=el('eDesc').value.trim(),value=Number(el('eValue').value);if(!description||value<=0)return toast('Informe descrição e valor válidos.');expenses.unshift({id:Date.now(),description,value,category:el('eCat').value,date:el('eDate').value||today()});save();el('modal').classList.remove('show');render();toast('Despesa registrada.')}
-function deleteExpense(id){if(!confirm('Excluir esta despesa?'))return;expenses=expenses.filter(e=>e.id!==id);save();render()}
+async function saveExpense(){
+ const description=el('eDesc').value.trim(),value=Number(el('eValue').value),category=el('eCat').value,date=el('eDate').value||today();
+ if(!description||!Number.isFinite(value)||value<=0)return toast('Informe descrição e valor válidos.');
+ if(currentProfile?.role!=='admin')return toast('Somente o administrador pode registrar despesas.');
+ try{
+  const {error}=await sbClient.from('expenses').insert({description,category,value,date});
+  if(error)throw error;
+  el('modal').classList.remove('show');
+  await loadSharedData();render();toast('Despesa registrada e sincronizada.');
+ }catch(err){toast('Não foi possível registrar a despesa: '+(err.message||'erro desconhecido'));}
+}
+async function deleteExpense(id){
+ if(!confirm('Excluir esta despesa?'))return;
+ if(currentProfile?.role!=='admin')return toast('Somente o administrador pode excluir despesas.');
+ try{const {error}=await sbClient.from('expenses').delete().eq('id',id);if(error)throw error;await loadSharedData();render();toast('Despesa excluída da nuvem.');}
+ catch(err){toast('Não foi possível excluir a despesa: '+(err.message||'erro desconhecido'));}
+}
 function customersPage(){return `${pageHead('Clientes','Cadastre clientes e consulte suas informações.',`<button onclick="openCustomerModal()">＋ Novo cliente</button>`)}<div class="card"><div class="toolbar"><input id="custSearch" placeholder="Buscar cliente..." oninput="filterCustomers(this.value)"><button class="secondary" onclick="exportCSV('customers')">Exportar CSV</button></div><div class="tablewrap"><table><thead><tr><th>Nome</th><th>Telefone</th><th>E-mail</th><th>Pedidos</th><th>Total comprado</th><th>Ação</th></tr></thead><tbody id="customersBody">${customersTable(customers)}</tbody></table></div></div>`}
 function customersTable(arr){return arr.map(c=>{let os=orders.filter(o=>o.customerId===c.id);return `<tr><td><strong>${c.name}</strong></td><td>${c.phone||'—'}</td><td>${c.email||'—'}</td><td>${os.length}</td><td>${money(os.reduce((s,o)=>s+o.total,0))}</td><td><button class="danger" onclick="deleteCustomer(${c.id})">Excluir</button></td></tr>`}).join('')||'<tr><td colspan="6" class="empty">Nenhum cliente cadastrado.</td></tr>'}
 function filterCustomers(q){el('customersBody').innerHTML=customersTable(customers.filter(c=>(c.name+' '+c.phone+' '+c.email).toLowerCase().includes(q.toLowerCase())))}
