@@ -132,8 +132,10 @@ async function loadSharedData(){
   const allTabIds=(remoteTabs||[]).map(t=>t.id);
   let remoteTabOrders=[];
   if(allTabIds.length){const {data,error}=await sbClient.from('orders').select('id,tab_id,product_id,quantity,unit_price,status,created_at').in('tab_id',allTabIds);if(error)throw new Error('Não foi possível carregar itens das comandas: '+error.message);remoteTabOrders=data||[];}
-  const {data: profiles}=await sbClient.from('profiles').select('id,full_name,role,active').eq('active',true);
-  const profileNames=new Map((profiles||[]).map(x=>[String(x.id),x.full_name||'Usuário']));
+  const {data: profiles,error: profilesError}=await sbClient.from('profiles').select('id,full_name,role,active').eq('active',true);
+  if(profilesError)throw new Error('Não foi possível carregar garçons/perfis ativos: '+profilesError.message);
+  activeProfiles=(profiles||[]).filter(x=>x.active!==false);
+  const profileNames=new Map(activeProfiles.map(x=>[String(x.id),x.full_name||'Usuário']));
   const tableNames=new Map(tables.map(t=>[Number(t.id),t.name]));
   const itemMap=new Map();
   for(const row of remoteTabOrders){const key=String(row.tab_id);if(!itemMap.has(key))itemMap.set(key,[]);const p=products.find(x=>Number(x.id)===Number(row.product_id));itemMap.get(key).push({id:Number(row.product_id),orderId:Number(row.id),name:p?.name||'Produto removido',price:Number(row.unit_price||0),cost:Number(p?.cost||0),stock:Number(p?.stock||0),qty:Number(row.quantity||0),emoji:p?.emoji||'📦',category:p?.category||'Geral'});}
@@ -143,6 +145,12 @@ async function loadSharedData(){
 let sharedRealtimeChannel=null;
 let realtimeLastEvent='Nenhum evento recebido ainda';
 let realtimeEventCount=0;
+let realtimeRetryTimer=null;
+let realtimeRetryAttempt=0;
+let realtimeStopped=false;
+let realtimeGeneration=0;
+let activeProfiles=[];
+let activeComandaModalId=null;
 function setRealtimeStatus(state,title,detail=''){
   const box=document.getElementById('realtimeStatus');
   if(!box)return;
@@ -155,8 +163,25 @@ function noteRealtimeEvent(table,event){
   setRealtimeStatus('ok','Sincronização conectada',`Eventos recebidos: ${realtimeEventCount}. Último: ${realtimeLastEvent}`);
   queueSharedRefresh();
 }
+function stopSharedRealtime(){
+  realtimeStopped=true;
+  realtimeGeneration++;
+  if(realtimeRetryTimer){clearTimeout(realtimeRetryTimer);realtimeRetryTimer=null;}
+  if(sharedRealtimeChannel){const old=sharedRealtimeChannel;sharedRealtimeChannel=null;sbClient.removeChannel(old).catch(err=>console.warn('[PosBytz Realtime] remoção do canal:',err));}
+}
+function scheduleRealtimeReconnect(reason='conexão interrompida'){
+  if(realtimeStopped||!currentUser||realtimeRetryTimer)return;
+  const delay=Math.min(30000,1000*Math.pow(2,Math.min(realtimeRetryAttempt,5)))+Math.floor(Math.random()*300);
+  realtimeRetryAttempt++;
+  setRealtimeStatus('wait','Sincronização: reconectando...',`${reason}. Nova tentativa em ${Math.ceil(delay/1000)}s.`);
+  realtimeRetryTimer=setTimeout(()=>{realtimeRetryTimer=null;if(!realtimeStopped&&currentUser)startSharedRealtime();},delay);
+}
 function startSharedRealtime(){
-  if(sharedRealtimeChannel) sbClient.removeChannel(sharedRealtimeChannel);
+  if(!currentUser)return;
+  realtimeStopped=false;
+  if(realtimeRetryTimer){clearTimeout(realtimeRetryTimer);realtimeRetryTimer=null;}
+  if(sharedRealtimeChannel){const old=sharedRealtimeChannel;sharedRealtimeChannel=null;sbClient.removeChannel(old).catch(err=>console.warn('[PosBytz Realtime] remoção do canal:',err));}
+  const generation=++realtimeGeneration;
   setRealtimeStatus('wait','Sincronização: conectando...','Aguardando confirmação do Supabase.');
   sharedRealtimeChannel=sbClient.channel('posbytz-shared-live')
     .on('postgres_changes',{event:'*',schema:'public',table:'products'},payload=>noteRealtimeEvent('products',payload.eventType||'alteração'))
@@ -167,13 +192,21 @@ function startSharedRealtime(){
     .on('postgres_changes',{event:'*',schema:'public',table:'posbytz_sale_items'},payload=>noteRealtimeEvent('posbytz_sale_items',payload.eventType||'alteração'))
     .on('postgres_changes',{event:'*',schema:'public',table:'expenses'},payload=>noteRealtimeEvent('expenses',payload.eventType||'alteração'))
     .subscribe((status,error)=>{
+      if(generation!==realtimeGeneration||realtimeStopped)return;
       console.info('[PosBytz Realtime]',status,error||'');
-      if(status==='SUBSCRIBED') setRealtimeStatus('ok','Sincronização conectada','Canal conectado. Aguardando alterações nas tabelas.');
-      else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED') setRealtimeStatus('error','Falha na sincronização',`${status}${error?.message?': '+error.message:''}. Verifique permissões SELECT e Realtime no Supabase.`);
-      else setRealtimeStatus('wait',`Sincronização: ${status}`,'Aguardando conexão.');
+      if(status==='SUBSCRIBED'){
+        realtimeRetryAttempt=0;
+        setRealtimeStatus('ok','Sincronização conectada','Canal conectado. Aguardando alterações nas tabelas.');
+        queueSharedRefresh();
+      } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        setRealtimeStatus('error','Falha na sincronização',`${status}${error?.message?': '+error.message:''}. Será tentada reconexão automática. Verifique permissões SELECT e Realtime no Supabase.`);
+        if(sharedRealtimeChannel){const failed=sharedRealtimeChannel;sharedRealtimeChannel=null;sbClient.removeChannel(failed).catch(()=>{});}
+        scheduleRealtimeReconnect(status);
+      } else setRealtimeStatus('wait',`Sincronização: ${status}`,'Aguardando conexão.');
     });
 }
 let refreshInProgress=false, refreshQueued=false, refreshDebounceTimer=null;
+let sharedRefreshSequence=0;
 function queueSharedRefresh(){
   if(refreshDebounceTimer)clearTimeout(refreshDebounceTimer);
   refreshDebounceTimer=setTimeout(()=>{refreshDebounceTimer=null;refreshSharedView();},180);
@@ -182,8 +215,10 @@ async function refreshSharedView(){
   if(!currentUser)return;
   if(refreshInProgress){refreshQueued=true;return;}
   refreshInProgress=true;
+  const sequence=++sharedRefreshSequence;
   try{
     await loadSharedData();
+    if(sequence!==sharedRefreshSequence||!currentUser)return;
     render();
     if(activeComandaModalId!==null&&el('modal').classList.contains('show')){
       const updated=comandas.find(c=>String(c.id)===String(activeComandaModalId));
@@ -196,6 +231,7 @@ async function refreshSharedView(){
 async function enterWithSession(session){
   if(!session?.user){currentUser=null;currentProfile=null;setAppVisible(false);return;}
   currentUser=session.user;
+  realtimeStopped=false;
   try {
   authMessage('Login aceito. Carregando perfil...');
   await loadAuthProfile(currentUser);
@@ -211,7 +247,18 @@ async function enterWithSession(session){
   authMessage('Erro ao entrar: ' + (err.message || String(err)));
 }
 }
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&currentUser){queueSharedRefresh();}});
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&currentUser){
+    queueSharedRefresh();
+    if(!sharedRealtimeChannel&&!realtimeRetryTimer)startSharedRealtime();
+  }
+});
+window.addEventListener('online',()=>{
+  if(currentUser){realtimeRetryAttempt=0;queueSharedRefresh();startSharedRealtime();}
+});
+window.addEventListener('offline',()=>{
+  if(currentUser)setRealtimeStatus('wait','Sem conexão de internet','As alterações serão sincronizadas quando a conexão voltar.');
+});
 document.getElementById('authForm').addEventListener('submit',async e=>{
   e.preventDefault();
 const emailDigitado = document.getElementById('authEmail').value;
@@ -229,7 +276,7 @@ authMessage('Verificando login...');
   finally{button.disabled=false;button.textContent='Entrar';}
 });
 document.getElementById('logoutBtn').addEventListener('click',async()=>{
-  if(sharedRealtimeChannel){await sbClient.removeChannel(sharedRealtimeChannel);sharedRealtimeChannel=null;}
+  stopSharedRealtime();
   setRealtimeStatus('wait','Sincronização: desconectada','Faça login para conectar novamente.');
   await sbClient.auth.signOut(); currentUser=null;currentProfile=null;setAppVisible(false);authMessage('');
 });
@@ -262,7 +309,6 @@ function toast(msg){el('toast').textContent=msg;el('toast').style.display='block
 function setPage(p){if(currentProfile?.role!=='admin' && adminOnlyPages.has(p)){toast('Acesso exclusivo do administrador.');return;}page=p;document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.page===p));el('topTitle').textContent=({dashboard:'Dashboard',pos:'Frente de caixa',orders:'Pedidos',comandas:'Mesas e comandas',waiters:'Garçons',inventory:'Estoque',products:'Produtos',accounting:'Financeiro',customers:'Clientes',reports:'Relatórios',settings:'Configurações'})[p];el('sidebar').classList.remove('open');render()}
 document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>setPage(b.dataset.page)));
 el('menuBtn').onclick=()=>el('sidebar').classList.toggle('open');el('quickSale').onclick=()=>setPage('pos');el('closeModal').onclick=()=>{el('modal').classList.remove('show');activeComandaModalId=null;};
-let activeComandaModalId=null;
 function openModal(title,html,after){activeComandaModalId=null;el('modalTitle').textContent=title;el('modalBody').innerHTML=html;el('modal').classList.add('show');if(after)after()}
 function stat(title,value,icon,sub=''){return `<div class="card stat"><div class="stat-icon">${icon}</div><div><label>${title}</label><div class="value">${value}</div><small>${sub}</small></div></div>`}
 function pageHead(title,sub,button=''){return `<div class="pagehead"><div><h1>${title}</h1><p>${sub}</p></div>${button}</div>`}
@@ -470,20 +516,26 @@ function backup(){let data={products,orders,customers,expenses,waiters,tables,co
 function restoreBackup(ev){let f=ev.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{let d=JSON.parse(r.result);if(!Array.isArray(d.products)||!Array.isArray(d.orders))throw Error();products=d.products;orders=d.orders;customers=d.customers||[];expenses=d.expenses||[];waiters=d.waiters||waiters;tables=d.tables||tables;comandas=d.comandas||[];localStorage.setItem('pb_bizName',d.bizName||'Meu Restaurante');save();render();toast('Backup restaurado.')}catch(e){toast('Arquivo de backup inválido.')}};r.readAsText(f);ev.target.value=''}
 function resetDemo(){if(!confirm('Isso substituirá os dados atuais pelos dados iniciais e apagará vendas/clientes/despesas deste navegador. Continuar?'))return;products=starterProducts.map(p=>({...p}));orders=[];customers=[];expenses=[];cart=[];save();render();toast('Dados de exemplo restaurados.')}
 
-function waiterOptions(selected=''){const id=String(currentUser?.id||'');const name=currentProfile?.full_name||currentUser?.email||'Usuário logado';return `<option value="${id}" selected>${name} (usuário logado)</option>`}
+function waiterOptions(selected=''){
+ const currentId=String(selected||currentUser?.id||'');
+ return activeProfiles.map(profile=>`<option value="${String(profile.id)}" ${String(profile.id)===currentId?'selected':''}>${profile.full_name||'Usuário'}${String(profile.id)===String(currentUser?.id)?' (você)':''}</option>`).join('')||'<option value="">Nenhum perfil ativo cadastrado</option>';
+}
 function openComandaModal(tableId=null){
  const freeTables=tables.filter(t=>!comandas.some(c=>c.tableId===t.id&&c.status==='Aberta'));
  openModal('Abrir comanda',`<div class="formgrid"><div class="field"><label>Mesa</label><select id="comTable">${(tableId?tables.filter(t=>t.id===tableId):freeTables).map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div><div class="field"><label>Garçom responsável</label><select id="comWaiter">${waiterOptions()}</select></div><div class="field"><label>Cliente (opcional)</label><input id="comGuest" placeholder="Ex.: Família da janela"></div></div><button style="width:100%;margin-top:16px" onclick="createComanda()">Abrir comanda</button>`)
 }
 async function createComanda(){
  const tableId=Number(el('comTable')?.value);
-  const customerName=el('comGuest')?.value?.trim()||null;
+ const waiterId=String(el('comWaiter')?.value||'');
+ const customerName=el('comGuest')?.value?.trim()||null;
  if(!tableId)return toast('Não há mesa livre disponível.');
  if(!currentUser)return toast('Faça login novamente para abrir uma comanda.');
+ if(!activeProfiles.some(profile=>String(profile.id)===waiterId))return toast('Selecione um garçom ativo.');
  if(comandas.some(c=>c.tableId===tableId&&c.status==='Aberta'))return toast('Essa mesa já possui comanda aberta.');
  try{
-  const {data,error}=await sbClient.from('tabs').insert({table_id:tableId,waiter_id:currentUser.id,customer_name:customerName,status:'open'}).select('id').single();
+  const {data,error}=await sbClient.from('tabs').insert({table_id:tableId,waiter_id:waiterId,customer_name:customerName,status:'open'}).select('id').single();
   if(error)throw error;
+  if(!data?.id)throw new Error('O Supabase não confirmou o ID da comanda criada.');
   el('modal').classList.remove('show');await loadSharedData();setPage('comandas');toast('Comanda aberta e compartilhada entre os dispositivos.');
  }catch(err){toast('Não foi possível abrir a comanda: '+err.message);}
 }
@@ -505,38 +557,79 @@ function manageComanda(id){
  activeComandaModalId=String(id);
 }
 async function updateComandaWaiter(id, waiterId){
- // O vínculo da comanda usa o perfil autenticado (UUID), não o cadastro local de garçons.
- const c=comandas.find(c=>String(c.id)===String(id));if(!c)return;
- if(String(waiterId)!==String(currentUser?.id))return toast('A comanda fica vinculada ao usuário autenticado.');
- const {error}=await sbClient.from('tabs').update({waiter_id:currentUser.id}).eq('id',Number(id));
- if(error)toast('Não foi possível atualizar o responsável: '+error.message);else await loadSharedData();
+ const c=comandas.find(c=>String(c.id)===String(id));
+ if(!c||c.status!=='Aberta')return;
+ if(!activeProfiles.some(profile=>String(profile.id)===String(waiterId)))return toast('Selecione um garçom ativo.');
+ try{
+  const {data,error}=await sbClient.from('tabs').update({waiter_id:waiterId})
+    .eq('id',Number(id)).eq('status','open').select('id').maybeSingle();
+  if(error)throw error;
+  if(!data?.id)throw new Error('Nenhuma comanda aberta foi atualizada. Verifique a permissão de alteração (RLS).');
+  await loadSharedData();
+  if(el('modal').classList.contains('show'))manageComanda(id);
+ }catch(err){toast('Não foi possível atualizar o responsável: '+err.message);}
 }
 async function addToComanda(id){
- const c=comandas.find(c=>String(c.id)===String(id)),p=products.find(p=>p.id===Number(el('comProduct')?.value)),qty=Math.floor(Number(el('comQty')?.value||1));
- if(!c||c.status!=='Aberta'||!p||qty<1)return toast('Confira a comanda, o produto e a quantidade.');
- const current=c.items.find(i=>i.id===p.id)?.qty||0;
- if(current+qty>p.stock)return toast('Quantidade maior que o estoque disponível.');
- try{const {error}=await sbClient.from('orders').insert({tab_id:Number(id),product_id:p.id,quantity:qty,unit_price:p.price,status:'pending'});if(error)throw error;await loadSharedData();manageComanda(id);toast('Item lançado e sincronizado.');}
- catch(err){toast('Não foi possível lançar o item: '+err.message);}
+ const c=comandas.find(c=>String(c.id)===String(id));
+ const p=products.find(p=>Number(p.id)===Number(el('comProduct')?.value));
+ const qty=Math.floor(Number(el('comQty')?.value||1));
+ if(!currentUser)return toast('Faça login novamente para lançar itens.');
+ if(!c||c.status!=='Aberta'||!p||!Number.isSafeInteger(qty)||qty<1)return toast('Confira a comanda, o produto e a quantidade.');
+ if(qty>p.stock)return toast('Quantidade maior que o estoque disponível.');
+ try{
+  const {data:tab,error:tabError}=await sbClient.from('tabs').select('id,status')
+    .eq('id',Number(id)).eq('status','open').maybeSingle();
+  if(tabError)throw tabError;
+  if(!tab)throw new Error('A comanda não está mais aberta no banco. Atualize a tela.');
+  const {data,error}=await sbClient.from('orders').insert({tab_id:Number(id),product_id:p.id,quantity:qty,unit_price:p.price,status:'pending'}).select('id').single();
+  if(error)throw error;
+  if(!data?.id)throw new Error('O Supabase não confirmou o item lançado.');
+  await loadSharedData();manageComanda(id);toast('Item lançado e sincronizado.');
+ }catch(err){toast('Não foi possível lançar o item: '+err.message);}
 }
 async function changeComandaQty(id,idx,d){
- const c=comandas.find(c=>String(c.id)===String(id));if(!c||c.status!=='Aberta')return;
- const i=c.items[idx],p=products.find(p=>p.id===i?.id);if(!i)return;
+ const c=comandas.find(c=>String(c.id)===String(id));
+ if(!c||c.status!=='Aberta')return;
+ const i=c.items[idx],p=products.find(p=>Number(p.id)===Number(i?.id));
+ if(!i||!Number.isInteger(d)||Math.abs(d)!==1)return;
  if(d>0&&(i.qty+1)>(p?.stock||0))return toast('Estoque insuficiente.');
  try{
-  if(i.qty+d<=0){const {error}=await sbClient.from('orders').delete().eq('id',i.orderId);if(error)throw error;}
-  else {const {error}=await sbClient.from('orders').update({quantity:i.qty+d}).eq('id',i.orderId);if(error)throw error;}
+  const {data:tab,error:tabError}=await sbClient.from('tabs').select('id,status')
+    .eq('id',Number(id)).eq('status','open').maybeSingle();
+  if(tabError)throw tabError;
+  if(!tab)throw new Error('A comanda já foi fechada ou não está acessível.');
+  if(i.qty+d<=0){
+   const {data,error}=await sbClient.from('orders').delete().eq('id',i.orderId)
+     .eq('tab_id',Number(id)).select('id').maybeSingle();
+   if(error)throw error;
+   if(!data?.id)throw new Error('O item não foi excluído. Atualize a comanda e tente novamente.');
+  }else{
+   const {data,error}=await sbClient.from('orders').update({quantity:i.qty+d}).eq('id',i.orderId)
+     .eq('tab_id',Number(id)).select('id').maybeSingle();
+   if(error)throw error;
+   if(!data?.id)throw new Error('A quantidade não foi atualizada. Verifique a permissão de alteração (RLS).');
+  }
   await loadSharedData();manageComanda(id);
  }catch(err){toast('Não foi possível alterar a quantidade: '+err.message);}
 }
 async function closeComanda(id){
- const c=comandas.find(c=>String(c.id)===String(id));if(!c||!c.items.length)return toast('Lance pelo menos um item antes de fechar.');
+ const c=comandas.find(c=>String(c.id)===String(id));
+ if(!c||c.status!=='Aberta'||!c.items.length)return toast('A comanda precisa estar aberta e conter itens.');
+ const button=el('modalBody')?.querySelector('button[onclick^="closeComanda"]');
+ if(button?.disabled)return;
+ if(button){button.disabled=true;button.textContent='Fechando comanda…';}
  const payment=el('comPayment')?.value||'Pix';
  try{
-  const {data,error}=await sbClient.rpc('close_pos_tab',{p_tab_id:Number(id),p_payment_method:payment});
+  // A RPC deve realizar fechamento, registro da venda e baixa do estoque; o cliente não repete essas operações.
+  const {error}=await sbClient.rpc('close_pos_tab',{p_tab_id:Number(id),p_payment_method:payment});
   if(error)throw error;
-  el('modal').classList.remove('show');await loadSharedData();setPage('comandas');toast('Comanda fechada, estoque atualizado e venda registrada.');
- }catch(err){toast('Não foi possível fechar a comanda: '+err.message+'. Confira se executou o arquivo SQL de instalação.');}
+  await loadSharedData();
+  const updated=comandas.find(tab=>String(tab.id)===String(id));
+  if(updated&&updated.status==='Aberta')throw new Error('A RPC retornou sem erro, mas a comanda continua aberta no banco. Verifique close_pos_tab.');
+  el('modal').classList.remove('show');activeComandaModalId=null;setPage('comandas');
+  toast('Comanda fechada; venda e estoque processados pela operação do banco.');
+ }catch(err){toast('Não foi possível fechar a comanda: '+err.message+'. Verifique se a função close_pos_tab está instalada e transacional.');}
+ finally{if(button){button.disabled=false;button.textContent='Fechar comanda e registrar venda';}}
 }
 function waitersPage(){return `${pageHead('Garçons','Cadastre a equipe e veja quem está responsável por cada comanda.',`<button onclick="openWaiterModal()">＋ Cadastrar garçom</button>`)}<div class="card"><div class="tablewrap"><table><thead><tr><th>Garçom</th><th>Status</th><th>Comandas abertas</th><th>Consumo em atendimento</th><th>Ações</th></tr></thead><tbody>${waiters.map(w=>{let cs=comandas.filter(c=>c.status==='Aberta'&&c.waiterId===w.id);return `<tr><td><strong>♙ ${w.name}</strong></td><td><span class="pill ${w.active?'':'off'}">${w.active?'Ativo':'Inativo'}</span></td><td>${cs.length}</td><td>${money(cs.reduce((s,c)=>s+c.items.reduce((a,i)=>a+i.price*i.qty,0),0))}</td><td><div class="row-actions"><button class="secondary" onclick="toggleWaiter(${w.id})">${w.active?'Desativar':'Ativar'}</button><button class="secondary" onclick="renameWaiter(${w.id})">Renomear</button></div></td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Cadastre o primeiro garçom.</td></tr>'}</tbody></table></div></div><p class="footer-note">Garçons desativados deixam de aparecer em novas comandas. Comandas já abertas preservam o responsável.</p>`}
 function openWaiterModal(){openModal('Cadastrar garçom',`<div class="field"><label>Nome do garçom</label><input id="waiterName" placeholder="Ex.: João"></div><button style="width:100%;margin-top:16px" onclick="saveWaiter()">Cadastrar</button>`)}
