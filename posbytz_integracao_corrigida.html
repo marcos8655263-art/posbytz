@@ -222,8 +222,14 @@ async function refreshSharedView(){
     render();
     if(activeComandaModalId!==null&&el('modal').classList.contains('show')){
       const updated=comandas.find(c=>String(c.id)===String(activeComandaModalId));
-      if(updated&&updated.status==='Aberta')manageComanda(activeComandaModalId);
-      else{el('modal').classList.remove('show');activeComandaModalId=null;}
+      if(!updated||updated.status!=='Aberta'){
+        el('modal').classList.remove('show');
+        activeComandaModalId=null;
+      }
+      // Não reconstruir o modal da comanda a cada evento Realtime.
+      // Isso recriava o <select id="comProduct"> e fechava o menu nativo
+      // do Safari/iPad durante a escolha do produto. Atualizações feitas
+      // pelo próprio usuário continuam redesenhando a comanda em add/change.
     }
   }catch(err){console.error('Falha ao sincronizar:',err);}
   finally{refreshInProgress=false;if(refreshQueued){refreshQueued=false;queueSharedRefresh();}}
