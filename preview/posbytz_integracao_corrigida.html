@@ -44,6 +44,13 @@
   .product-pick-card{min-height:92px;padding:10px}
   .category-chip{min-height:44px}
 }
+@media(max-width:380px){
+  .product-pick-card{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto auto;justify-items:start;row-gap:2px;min-height:112px;padding:8px}
+  .product-pick-emoji{grid-row:auto;font-size:18px}
+  .product-pick-name{min-height:3.6em;font-size:12px;-webkit-line-clamp:3}
+  .product-pick-price{font-size:14px}
+  .product-pick-stock{grid-column:1}
+}
 </style>
 
 <style>
